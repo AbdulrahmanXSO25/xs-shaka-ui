@@ -1,4 +1,4 @@
-import { PlayerConfig, PlayerError, PlayerState, VideoSource } from './types';
+import { PlayerConfig, PlayerError, PlayerState, QualityLevel, VideoSource } from './types';
 import { DEFAULT_CONFIG } from './config';
 
 declare global {
@@ -112,6 +112,8 @@ export class VideoPlayer {
     this.configurePlayer();
     this.configureUI();
 
+    this.setupQualityListeners();
+
     this.player.addEventListener('error', (event: any) => {
       this.handleError(this.parseError(event.detail));
     });
@@ -148,6 +150,37 @@ export class VideoPlayer {
     this.videoElement.addEventListener('ended', () => this.updateState(PlayerState.ENDED));
   }
 
+  private setupQualityListeners(): void {
+    if (!this.player) return;
+    const notify = () => this.notifyQualityChange();
+    // Shaka fires 'adaptation' and 'variantchanged' on quality switch
+    this.player.addEventListener('adaptation', notify);
+    this.player.addEventListener('variantchanged', notify);
+    // Also listen to trackschanged (manifest loaded)
+    this.player.addEventListener('trackschanged', notify);
+  }
+
+  private notifyQualityChange(): void {
+    if (!this.config.onQualityChange) return;
+    const isAuto = this.isAutoQuality();
+    const current = this.getCurrentQuality();
+    this.config.onQualityChange(current, isAuto);
+  }
+
+  private trackToQualityLevel(track: any): QualityLevel {
+    const height = track.height ?? null;
+    const label = height ? `${height}p` : track.label || `${Math.round(track.bandwidth / 1000)} kbps`;
+    return {
+      id: track.id,
+      height,
+      width: track.width ?? null,
+      bandwidth: track.bandwidth,
+      label,
+      active: !!track.active,
+      originalTrack: track,
+    };
+  }
+
   private updateState(state: PlayerState): void {
     this.currentState = state;
     this.config.onStateChange?.(state);
@@ -181,6 +214,15 @@ export class VideoPlayer {
       if (this.config.autoplay) {
         await this.play();
       }
+
+      if (typeof source !== 'string' && source.chaptersUrl) {
+        await this.player.addChaptersTrack(source.chaptersUrl, 'en', 'text/vtt');
+        console.log('✅ Chapters track added:', source.chaptersUrl);
+      }
+
+      // Emit initial quality (manifest-based levels now known)
+      this.notifyQualityChange();
+
     } catch (error) {
       this.handleError({
         code: -1,
@@ -243,6 +285,152 @@ export class VideoPlayer {
 
   public getState(): PlayerState {
     return this.currentState;
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Quality handling – manifest-based manual switching (ABR override)
+  // ──────────────────────────────────────────────────────────────
+
+  /**
+   * Raw Shaka variant tracks. Empty array if manifest not loaded yet.
+   * Type `any` to avoid hard dependency on shaka-player types.
+   */
+  public getVariantTracks(): any[] {
+    if (!this.player?.getVariantTracks) return [];
+    try {
+      return this.player.getVariantTracks() || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Distinct quality levels derived from manifest.
+   * Sorted high -> low (1080p -> 144p). Deduped by height, keeping
+   * highest bandwidth per height (covers multi-bitrate same resolution).
+   * Works with DASH SegmentBase byte-range (single mp4) manifests.
+   */
+  public getQualityLevels(): QualityLevel[] {
+    const tracks = this.getVariantTracks().filter((t: any) => t.height != null);
+    const byHeight = new Map<number, any>();
+    for (const t of tracks) {
+      const existing = byHeight.get(t.height);
+      if (!existing || t.bandwidth > existing.bandwidth) {
+        byHeight.set(t.height, t);
+      }
+    }
+    return Array.from(byHeight.values())
+      .map((t) => this.trackToQualityLevel(t))
+      .sort((a, b) => (b.height! - a.height!));
+  }
+
+  /**
+   * Currently active quality, or null if not loaded / audio-only.
+   */
+  public getCurrentQuality(): QualityLevel | null {
+    const tracks = this.getVariantTracks();
+    const active = tracks.find((t: any) => t.active);
+    return active ? this.trackToQualityLevel(active) : null;
+  }
+
+  /**
+   * True when ABR is enabled (Auto). False when a manual quality is locked.
+   */
+  public isAutoQuality(): boolean {
+    try {
+      return !!this.player?.getConfiguration?.()?.abr?.enabled;
+    } catch {
+      // fallback to config
+      return !!this.config.abr?.enabled;
+    }
+  }
+
+  /**
+   * Enable automatic ABR (Auto) – re-enables adaptive switching.
+   */
+  public enableAutoQuality(): void {
+    this.setQuality('auto');
+  }
+
+  /**
+   * Switch quality based on manifest heights.
+   * - `'auto'` → re-enable ABR.
+   * - `number` (e.g. 1080, 720, 480, 360, 240, 144) → lock to that height.
+   *
+   * For single-mp4 DASH with byte-range (`SegmentBase` + `BaseURL`), each
+   * `Representation` manifests as a variant track – selection triggers a
+   * range request for the new initialization/segment.
+   *
+   * @param height Height in pixels or 'auto'
+   * @param clearBuffer Whether to clear buffer on switch (default true)
+   */
+  public setQuality(height: number | 'auto', clearBuffer: boolean = true): void {
+    if (!this.player) throw new Error('Player not initialized');
+
+    if (height === 'auto') {
+      this.player.configure({ abr: { enabled: true } });
+      this.notifyQualityChange();
+      return;
+    }
+
+    const tracks = this.getVariantTracks();
+    if (tracks.length === 0) {
+      throw new Error('No variant tracks available – load a manifest first');
+    }
+
+    // Prefer exact height; pick highest bandwidth for that height
+    const candidates = tracks
+      .filter((t: any) => t.height === height)
+      .sort((a: any, b: any) => b.bandwidth - a.bandwidth);
+
+    if (candidates.length === 0) {
+      const available = this.getQualityLevels().map((q) => q.height).join(', ');
+      throw new Error(`Quality ${height}p not found. Available: ${available || 'none'}`);
+    }
+
+    const track = candidates[0];
+
+    // Disable ABR so manual choice persists, then select track
+    this.player.configure({ abr: { enabled: false } });
+    // Shaka API: selectVariantTrack(track, clearBuffer, safeMargin)
+    if (typeof this.player.selectVariantTrack === 'function') {
+      this.player.selectVariantTrack(track, clearBuffer);
+    } else {
+      // fallback: select via id if older API
+      this.player.selectVariantTrack(track, clearBuffer);
+    }
+    this.notifyQualityChange();
+  }
+
+  /**
+   * Direct variant selection by Shaka track id (advanced).
+   */
+  public setQualityById(trackId: number, clearBuffer: boolean = true): void {
+    if (!this.player) throw new Error('Player not initialized');
+    const track = this.getVariantTracks().find((t: any) => t.id === trackId);
+    if (!track) throw new Error(`Track id ${trackId} not found`);
+    this.player.configure({ abr: { enabled: false } });
+    this.player.selectVariantTrack(track, clearBuffer);
+    this.notifyQualityChange();
+  }
+
+  /**
+   * Update ABR enabled flag without switching track.
+   * Useful for toggling back to Auto via UI switch.
+   */
+  public setAbrEnabled(enabled: boolean): void {
+    this.player?.configure({ abr: { enabled } });
+    this.notifyQualityChange();
+  }
+
+  /** Escape hatch – direct Shaka Player instance */
+  public getShakaPlayer(): any {
+    return this.player;
+  }
+
+  /** Escape hatch – Shaka UI instance */
+  public getShakaUI(): any {
+    return this.ui;
   }
 
   public async destroy(): Promise<void> {

@@ -1,3 +1,17 @@
+export interface QualityLevel {
+  /** Shaka variant track id */
+  id: number;
+  /** Vertical resolution (e.g. 1080, 720, 144). Null for audio-only. */
+  height: number | null;
+  width: number | null;
+  bandwidth: number;
+  /** Human label like "1080p" or "Auto" */
+  label: string;
+  active: boolean;
+  /** Underlying Shaka track object for advanced use */
+  originalTrack?: any;
+}
+
 export interface PlayerConfig {
   container: HTMLElement;
   videoElement?: HTMLVideoElement;
@@ -10,6 +24,7 @@ export interface PlayerConfig {
   onReady?: () => void;
   onError?: (error: PlayerError) => void;
   onStateChange?: (state: PlayerState) => void;
+  onQualityChange?: (quality: QualityLevel | null, isAuto: boolean) => void;
 }
 
 export interface ShakaStreamingConfig {
@@ -82,4 +97,7 @@ export enum PlayerState {
 export interface VideoSource {
   url: string;
   type?: 'dash' | 'hls';
+  chaptersUrl?: string;
 }
+
+export type QualitySelection = number | 'auto';

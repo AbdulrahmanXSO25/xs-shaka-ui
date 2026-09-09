@@ -28,6 +28,53 @@ player.setVolume(0.5);
 await player.destroy();
 ```
 
+### Manual Quality Switching (manifest-based, ABR override)
+
+Works with DASH `SegmentBase` + byte-range single-`mp4` manifests (each `Representation` → variant track). Selection triggers range requests for new segments.
+
+```typescript
+import { VideoPlayer } from 'xs-shaka-ui';
+
+const player = new VideoPlayer({
+  container: document.getElementById('player-container')!,
+  abr: { enabled: true }, // start Auto
+  onQualityChange: (quality, isAuto) => {
+    console.log(isAuto ? 'Auto' : quality?.label, quality);
+  }
+});
+
+await player.load('https://example.com/video/manifest.mpd');
+
+// After load, enumerate qualities from manifest (1080p → 144p)
+const levels = player.getQualityLevels();
+console.log(levels); // [{height:1080,label:'1080p',bandwidth:4800000,active:true}, ...]
+
+// Pretty UI: render buttons
+levels.forEach(l => {
+  const btn = document.createElement('button');
+  btn.textContent = l.label;
+  btn.className = l.active && !player.isAutoQuality() ? 'active' : '';
+  btn.onclick = () => player.setQuality(l.height!); // locks quality, disables ABR
+  document.getElementById('quality-bar')!.appendChild(btn);
+});
+const autoBtn = document.createElement('button');
+autoBtn.textContent = 'Auto';
+autoBtn.className = player.isAutoQuality() ? 'active' : '';
+autoBtn.onclick = () => player.setQuality('auto'); // re-enable ABR
+document.getElementById('quality-bar')!.appendChild(autoBtn);
+
+// Programmatic API
+player.setQuality(720);          // lock 720p
+player.setQuality(1080);         // lock 1080p
+player.setQuality('auto');       // back to ABR
+player.setQualityById(123);      // by Shaka track id
+console.log(player.getCurrentQuality()); // {height:720,label:'720p',...}
+console.log(player.isAutoQuality());     // false when locked
+player.setAbrEnabled(true);      // toggle ABR without switching track
+player.getVariantTracks();       // raw Shaka tracks
+player.getShakaPlayer();         // escape hatch
+```
+
 ### Angular
 
 ```typescript
