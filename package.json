@@ -1,6 +1,6 @@
 {
   "name": "xs-shaka-ui",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A simple, easy-to-use video player library built on top of Shaka Player",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
